@@ -41,7 +41,7 @@ require (
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/sagernet/cors v1.2.1
 	github.com/sagernet/fswatch v0.1.1
-	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
+	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
 	github.com/sagernet/sing v0.5.2
 	github.com/sagernet/sing-mux v0.2.1
 	github.com/sagernet/sing-shadowtls v0.1.5
