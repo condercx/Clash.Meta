@@ -338,6 +338,10 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		return
 	}
 
+	if findProcessMode.Always() {
+		findPackageName(metadata)
+	}
+
 	switch mode {
 	case Direct:
 		proxy = proxies["DIRECT"]
@@ -348,6 +352,26 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		proxy, rule, err = match(metadata)
 	}
 	return
+}
+
+func findPackageName(metadata *C.Metadata) {
+	if !features.Android {
+		uid, path, err := P.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+		if err != nil {
+			log.Debugln("[Process] find process %s error: %v", metadata.String(), err)
+		} else {
+			metadata.Process = filepath.Base(path)
+			metadata.ProcessPath = path
+			metadata.Uid = uid
+		}
+	} else {
+		pkg, err := P.FindPackageName(metadata)
+		if err != nil {
+			log.Debugln("[Process] find process %s error: %v", metadata.String(), err)
+		} else {
+			metadata.Process = pkg
+		}
+	}
 }
 
 // processUDP starts a loop to handle udp packet
@@ -623,31 +647,9 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 			}()
 		}
 
-		if attemptProcessLookup && !findProcessMode.Off() && (findProcessMode.Always() || rule.ShouldFindProcess()) {
+		if attemptProcessLookup && !findProcessMode.Always() && rule.ShouldFindProcess() {
 			attemptProcessLookup = false
-			if !features.CMFA {
-				// normal check for process
-				uid, path, err := P.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
-				if err != nil {
-					log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-				} else {
-					metadata.Process = filepath.Base(path)
-					metadata.ProcessPath = path
-					metadata.Uid = uid
-
-					if pkg, err := P.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
-						metadata.Process = pkg
-					}
-				}
-			} else {
-				// check package names
-				pkg, err := P.FindPackageName(metadata)
-				if err != nil {
-					log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-				} else {
-					metadata.Process = pkg
-				}
-			}
+			findPackageName(metadata)
 		}
 
 		if matched, ada := rule.Match(metadata); matched {
