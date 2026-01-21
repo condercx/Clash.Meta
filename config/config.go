@@ -955,6 +955,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		)
 		proxies["GLOBAL"] = adapter.NewProxy(global)
 	}
+	SetProxyNameList(proxyList)
 	return proxies, providersMap, nil
 }
 
