@@ -1,9 +1,10 @@
 module github.com/metacubex/mihomo
 
-go 1.20
+go 1.22
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0
+	github.com/condercx/twin-go v0.0.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/enfein/mieru/v3 v3.31.0
@@ -143,3 +144,5 @@ require (
 
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
+
+replace github.com/condercx/twin-go => ../twin
