@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -87,7 +89,18 @@ func (t *Twin) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn,
 }
 
 func (t *Twin) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
-	return nil, C.ErrNotSupport
+	if err := t.ensureConn(ctx); err != nil {
+		return nil, err
+	}
+
+	pc := &twinPacketConn{
+		client:  t.client,
+		ctx:     ctx,
+		inbound: make(chan udpPacket, 256),
+		streams: make(map[string]*twinUDPStream),
+		closeCh: make(chan struct{}),
+	}
+	return newPacketConn(N.NewThreadSafePacketConn(pc), t), nil
 }
 
 func (t *Twin) Close() error {
@@ -222,3 +235,150 @@ func (c *twinNetConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *twinNetConn) SetWriteDeadline(t time.Time) error { return nil }
 
 var _ net.Conn = (*twinNetConn)(nil)
+
+// --- UDP PacketConn ---
+
+type udpPacket struct {
+	addr string
+	data []byte
+}
+
+type twinUDPStream struct {
+	stream  io.ReadWriteCloser
+	addr    string
+	parent  *twinPacketConn
+}
+
+type twinPacketConn struct {
+	client  *twin.Client
+	ctx     context.Context
+
+	mu       sync.Mutex
+	streams  map[string]*twinUDPStream
+	closed   bool
+
+	inbound chan udpPacket
+	closeCh chan struct{}
+	wg      sync.WaitGroup
+}
+
+func (pc *twinPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	addrStr := addr.String()
+
+	pc.mu.Lock()
+	us, ok := pc.streams[addrStr]
+	pc.mu.Unlock()
+
+	if !ok {
+		stream, err := pc.client.DialUDP(pc.ctx, addrStr)
+		if err != nil {
+			return 0, fmt.Errorf("open udp stream: %w", err)
+		}
+
+		us = &twinUDPStream{
+			stream: stream,
+			addr:   addrStr,
+			parent: pc,
+		}
+
+		pc.mu.Lock()
+		if pc.closed {
+			pc.mu.Unlock()
+			stream.Close()
+			return 0, net.ErrClosed
+		}
+		if existing, ok := pc.streams[addrStr]; ok {
+			pc.mu.Unlock()
+			stream.Close()
+			us = existing
+		} else {
+			pc.streams[addrStr] = us
+			pc.mu.Unlock()
+			pc.wg.Add(1)
+			go pc.udpReadLoop(us)
+		}
+	}
+
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(p)))
+	if _, err := us.stream.Write(lenBuf[:]); err != nil {
+		return 0, err
+	}
+	if _, err := us.stream.Write(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (pc *twinPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-pc.closeCh:
+		return 0, nil, net.ErrClosed
+	case pkt, ok := <-pc.inbound:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		n := copy(p, pkt.data)
+		udpAddr, _ := net.ResolveUDPAddr("udp", pkt.addr)
+		return n, udpAddr, nil
+	}
+}
+
+func (pc *twinPacketConn) udpReadLoop(us *twinUDPStream) {
+	defer pc.wg.Done()
+	defer func() {
+		pc.mu.Lock()
+		delete(pc.streams, us.addr)
+		pc.mu.Unlock()
+	}()
+
+	for {
+		var lenBuf [2]byte
+		_, err := io.ReadFull(us.stream, lenBuf[:])
+		if err != nil {
+			return
+		}
+		datalen := int(binary.BigEndian.Uint16(lenBuf[:]))
+		if datalen == 0 {
+			return
+		}
+
+		data := make([]byte, datalen)
+		_, err = io.ReadFull(us.stream, data)
+		if err != nil {
+			return
+		}
+
+		select {
+		case pc.inbound <- udpPacket{addr: us.addr, data: data}:
+		default:
+		}
+	}
+}
+
+func (pc *twinPacketConn) Close() error {
+	pc.mu.Lock()
+	if pc.closed {
+		pc.mu.Unlock()
+		return nil
+	}
+	pc.closed = true
+	streams := pc.streams
+	pc.streams = make(map[string]*twinUDPStream)
+	close(pc.closeCh)
+	pc.mu.Unlock()
+
+	for _, us := range streams {
+		us.stream.Close()
+	}
+
+	pc.wg.Wait()
+	return nil
+}
+
+func (pc *twinPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero, Port: 0} }
+func (pc *twinPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (pc *twinPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (pc *twinPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+var _ net.PacketConn = (*twinPacketConn)(nil)
