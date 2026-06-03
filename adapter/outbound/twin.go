@@ -2,7 +2,6 @@ package outbound
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -100,7 +99,7 @@ func (t *Twin) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 		client:  t.client,
 		ctx:     ctx,
 		inbound: make(chan udpPacket, 256),
-		streams: make(map[string]*twinUDPStream),
+		sessions: make(map[string]*twin.UDPSession),
 		closeCh: make(chan struct{}),
 	}
 	return newPacketConn(N.NewThreadSafePacketConn(pc), t), nil
@@ -258,18 +257,12 @@ type udpPacket struct {
 	data []byte
 }
 
-type twinUDPStream struct {
-	stream  io.ReadWriteCloser
-	addr    string
-	parent  *twinPacketConn
-}
-
 type twinPacketConn struct {
 	client  *twin.Client
 	ctx     context.Context
 
 	mu       sync.Mutex
-	streams  map[string]*twinUDPStream
+	sessions map[string]*twin.UDPSession
 	closed   bool
 
 	inbound chan udpPacket
@@ -281,45 +274,43 @@ func (pc *twinPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	addrStr := addr.String()
 
 	pc.mu.Lock()
-	us, ok := pc.streams[addrStr]
+	sess, ok := pc.sessions[addrStr]
 	pc.mu.Unlock()
 
 	if !ok {
-		stream, err := pc.client.DialUDPStream(pc.ctx, addrStr)
-		if err != nil {
-			return 0, fmt.Errorf("open udp stream: %w", err)
-		}
+		ctx, cancel := context.WithTimeout(pc.ctx, 10*time.Second)
+		defer cancel()
 
-		us = &twinUDPStream{
-			stream: stream,
-			addr:   addrStr,
-			parent: pc,
+		newSess, err := pc.client.NewUDPSession(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("open udp session: %w", err)
 		}
 
 		pc.mu.Lock()
 		if pc.closed {
 			pc.mu.Unlock()
-			stream.Close()
+			newSess.Close()
 			return 0, net.ErrClosed
 		}
-		if existing, ok := pc.streams[addrStr]; ok {
+		if existing, ok := pc.sessions[addrStr]; ok {
 			pc.mu.Unlock()
-			stream.Close()
-			us = existing
+			newSess.Close()
+			sess = existing
 		} else {
-			pc.streams[addrStr] = us
+			pc.sessions[addrStr] = newSess
 			pc.mu.Unlock()
+			sess = newSess
 			pc.wg.Add(1)
-			go pc.udpReadLoop(us)
+			go pc.udpReadLoop(newSess, addrStr)
 		}
 	}
 
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(p)))
-	if _, err := us.stream.Write(lenBuf[:]); err != nil {
+	host, portStr, err := net.SplitHostPort(addrStr)
+	if err != nil {
 		return 0, err
 	}
-	if _, err := us.stream.Write(p); err != nil {
+	port, _ := strconv.Atoi(portStr)
+	if err := sess.WriteTo(p, host, uint16(port)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -339,33 +330,23 @@ func (pc *twinPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-func (pc *twinPacketConn) udpReadLoop(us *twinUDPStream) {
+func (pc *twinPacketConn) udpReadLoop(sess *twin.UDPSession, addrStr string) {
 	defer pc.wg.Done()
 	defer func() {
 		pc.mu.Lock()
-		delete(pc.streams, us.addr)
+		delete(pc.sessions, addrStr)
 		pc.mu.Unlock()
 	}()
 
 	for {
-		var lenBuf [2]byte
-		_, err := io.ReadFull(us.stream, lenBuf[:])
+		data, host, port, err := sess.ReadFrom()
 		if err != nil {
 			return
 		}
-		datalen := int(binary.BigEndian.Uint16(lenBuf[:]))
-		if datalen == 0 {
-			return
-		}
-
-		data := make([]byte, datalen)
-		_, err = io.ReadFull(us.stream, data)
-		if err != nil {
-			return
-		}
+		replyAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 		select {
-		case pc.inbound <- udpPacket{addr: us.addr, data: data}:
+		case pc.inbound <- udpPacket{addr: replyAddr, data: data}:
 		default:
 		}
 	}
@@ -378,13 +359,13 @@ func (pc *twinPacketConn) Close() error {
 		return nil
 	}
 	pc.closed = true
-	streams := pc.streams
-	pc.streams = make(map[string]*twinUDPStream)
+	sessions := pc.sessions
+	pc.sessions = make(map[string]*twin.UDPSession)
 	close(pc.closeCh)
 	pc.mu.Unlock()
 
-	for _, us := range streams {
-		us.stream.Close()
+	for _, sess := range sessions {
+		sess.Close()
 	}
 
 	pc.wg.Wait()
