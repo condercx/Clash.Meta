@@ -3,9 +3,9 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"io"
 	"net"
-	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -16,6 +16,8 @@ import (
 	"github.com/metacubex/mihomo/log"
 
 	twin "github.com/condercx/twin-go"
+
+	"github.com/condercx/twin-go/obfs"
 
 	"github.com/metacubex/quic-go"
 	qtls "github.com/metacubex/tls"
@@ -204,7 +206,10 @@ func (t *Twin) ensureConn(ctx context.Context) error {
 		return fmt.Errorf("listen udp via dialer: %w", err)
 	}
 
-	quicConn, err := quic.Dial(ctx, packetConn, udpAddr, tlsConfig, quicCfg)
+	obfsKey := twin.DeriveObfsKey(tc.Password)
+	obfsPacketConn := obfs.NewObfsPacketConn(packetConn, obfsKey)
+
+	quicConn, err := quic.Dial(ctx, obfsPacketConn, udpAddr, tlsConfig, quicCfg)
 	if err != nil {
 		packetConn.Close()
 		return fmt.Errorf("quic dial: %w", err)
