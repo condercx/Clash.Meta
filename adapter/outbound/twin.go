@@ -24,12 +24,11 @@ import (
 
 type Twin struct {
 	*Base
-	option    *TwinOption
-	client    *twin.Client
-	quicConn  *quic.Conn
+	option     *TwinOption
+	client     *twin.Client
+	quicConn   *quic.Conn
 	packetConn net.PacketConn
-	mu        sync.Mutex
-	connected bool
+	mu         sync.Mutex
 }
 
 type TwinOption struct {
@@ -82,6 +81,11 @@ func (t *Twin) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn,
 	target := net.JoinHostPort(metadata.String(), strconv.Itoa(int(metadata.DstPort)))
 	stream, err := t.client.DialTCP(ctx, target)
 	if err != nil {
+		t.mu.Lock()
+		t.client = nil
+		t.quicConn = nil
+		t.packetConn = nil
+		t.mu.Unlock()
 		return nil, fmt.Errorf("twin dial tcp: %w", err)
 	}
 
@@ -104,6 +108,8 @@ func (t *Twin) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 }
 
 func (t *Twin) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.quicConn != nil {
 		_ = t.quicConn.CloseWithError(0, "proxy removed")
 	}
@@ -113,6 +119,9 @@ func (t *Twin) Close() error {
 	if t.client != nil {
 		_ = t.client.Close()
 	}
+	t.client = nil
+	t.quicConn = nil
+	t.packetConn = nil
 	return nil
 }
 
@@ -125,7 +134,13 @@ func (t *Twin) ProxyInfo() C.ProxyInfo {
 func (t *Twin) ensureConn(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.connected {
+
+	if t.client != nil && t.client.IsClosed() {
+		log.Debugln("Twin proxy [%s]: connection closed, reconnecting", t.Base.Name())
+		t.cleanupLocked()
+	}
+
+	if t.client != nil {
 		return nil
 	}
 
@@ -218,10 +233,24 @@ func (t *Twin) ensureConn(ctx context.Context) error {
 	t.client = client
 	t.quicConn = quicConn
 	t.packetConn = packetConn
-	t.connected = true
 
 	log.Debugln("Twin proxy [%s] connected to %s", t.Base.Name(), addr)
 	return nil
+}
+
+func (t *Twin) cleanupLocked() {
+	if t.quicConn != nil {
+		t.quicConn.CloseWithError(0, "reconnect")
+	}
+	if t.packetConn != nil {
+		t.packetConn.Close()
+	}
+	if t.client != nil {
+		t.client.Close()
+	}
+	t.client = nil
+	t.quicConn = nil
+	t.packetConn = nil
 }
 
 type twinNetConn struct {
@@ -235,8 +264,6 @@ func (c *twinNetConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *twinNetConn) SetWriteDeadline(t time.Time) error { return nil }
 
 var _ net.Conn = (*twinNetConn)(nil)
-
-// --- UDP PacketConn ---
 
 type udpPacket struct {
 	addr string
@@ -270,7 +297,7 @@ func (pc *twinPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	pc.mu.Unlock()
 
 	if !ok {
-		stream, err := pc.client.DialUDP(pc.ctx, addrStr)
+		stream, err := pc.client.DialUDPStream(pc.ctx, addrStr)
 		if err != nil {
 			return 0, fmt.Errorf("open udp stream: %w", err)
 		}
