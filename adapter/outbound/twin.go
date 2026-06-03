@@ -81,10 +81,9 @@ func (t *Twin) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn,
 	target := net.JoinHostPort(metadata.String(), strconv.Itoa(int(metadata.DstPort)))
 	stream, err := t.client.DialTCP(ctx, target)
 	if err != nil {
+		log.Debugln("Twin proxy [%s]: dial error %v, reconnecting", t.Base.Name(), err)
 		t.mu.Lock()
-		t.client = nil
-		t.quicConn = nil
-		t.packetConn = nil
+		t.cleanupLocked()
 		t.mu.Unlock()
 		return nil, fmt.Errorf("twin dial tcp: %w", err)
 	}
@@ -110,18 +109,7 @@ func (t *Twin) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 func (t *Twin) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.quicConn != nil {
-		_ = t.quicConn.CloseWithError(0, "proxy removed")
-	}
-	if t.packetConn != nil {
-		_ = t.packetConn.Close()
-	}
-	if t.client != nil {
-		_ = t.client.Close()
-	}
-	t.client = nil
-	t.quicConn = nil
-	t.packetConn = nil
+	t.cleanupLocked()
 	return nil
 }
 
